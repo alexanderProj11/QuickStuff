@@ -15,8 +15,8 @@ The script:
   4. writes the table as CSV (or TSV, pipe, etc.).
 
 Usage:
-    python lotus_sr_to_csv.py LINK_ServiceRequest_Data.txt
-    python lotus_sr_to_csv.py LINK_ServiceRequest_Data.txt -d "\t" -o sr.tsv
+    python lotus_sr_to_csv.py LINK_Co_Data_LocationsByCommonName.txt
+    python lotus_sr_to_csv.py LINK_Co_Data_LocationsByCommonName.txt -d "\t" -o sr.tsv
 """
 
 import argparse, csv, pathlib, re, sys, textwrap
