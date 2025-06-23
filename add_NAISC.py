@@ -23,13 +23,14 @@ from tqdm.auto import tqdm
 import unicodedata
 from typing import List
 import pandas as pd
-from autocorrect import Speller 
+from autocorrect import Speller
+from thefuzz import process, fuzz
 
 # ------------------------------------------------------------------
 # 1. PARAMETERS  ----------------------------------------------------
 # ------------------------------------------------------------------
 IN_FILE          = "cleaned_unions.csv"
-OUT_FILE         = "naics_clean.xlsx"
+OUT_FILE         = "naics_clean.csv"
 NAICS_CSV_STRUCT = "naics-scian-2022-structure-v1-eng.csv"
 FUZZY_THRESHOLD  = 80
 PAUSE_API        = 0.7          # polite delay between live queries
@@ -43,43 +44,78 @@ OPEN_CORP_URL    = "https://api.opencorporates.com/v0.4/companies/search"
 # ------------------------------------------------------------------
 def load_structure(path: str) -> pd.DataFrame:
     df = pd.read_csv(path, dtype=str).fillna("")
-    df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
-    # keep everything; index by the code for O(1) look-ups
-    return df.set_index("code")
+
+    # ←— make ALL column headings predictable
+    df.columns = (
+        df.columns
+          .str.strip()          # remove invisible spaces / line-feeds
+          .str.lower()          # canonical lower-case
+    )
+
+    # friendly aliases – update ONLY here if StatsCan changes wording
+    wanted = {
+        "code"              : "code",
+        "sector"            : "sector",
+        "subsector"         : "subsector",
+        "industry group"    : "industry group",
+        "industry"          : "industry",
+        "canadian industry" : "canadian industry",
+        "class title"       : "class title",
+    }
+
+    # verify the header really contains everything we need
+    missing = [col for col in wanted if col not in df.columns]
+    if missing:                                   # •–– safety net ––•
+        raise ValueError(
+            f"NAICS structure CSV is missing expected column(s): {missing}"
+        )
+
+    # keep everything but index by 6-digit NAICS code for O(1) look-ups
+    return df.rename(columns=wanted).set_index("code")
 
 STRUCT = load_structure(NAICS_CSV_STRUCT)
 
-def split_chain(code: str) -> dict[str, str]:
-    """
-    Given a 6-digit NAICS code, walk up the Parent chain and return:
-      Sector, Subsector, Industry_group, Industry, Canadian_industry, Class_desc
-    Empty strings if something is missing.
-    """
-    res = dict.fromkeys(
-        ["Sector", "Subsector", "Industry_group", "Industry",
-         "Canadian_industry", "Class_desc"], ""
-    )
-    row = STRUCT.loc[code] if code in STRUCT.index else None
-    if row is None:
-        return res
+# the master DataFrame with clean headings is already in memory,
+# so re-use it instead of re-reading the file:
+naics_df = STRUCT.reset_index().copy()
+naics_df["clean_title"] = (
+    naics_df["class title"]
+      .str.strip()
+      .str.lower()
+)
 
-    # Level 5 == Canadian industry
-    res["Canadian_industry"] = row.class_title
-    res["Class_desc"]        = row.class_definition
-    parent = row.parent
+NAICS_CHOICES     = naics_df["clean_title"].tolist()
+TITLE_TO_CODE     = dict(zip(naics_df["clean_title"], naics_df["code"]))
 
-    while parent and parent in STRUCT.index:
-        prow   = STRUCT.loc[parent]
-        lvl    = int(prow.level)
-        title  = prow.class_title
+CODE_TO_HIERARCHY = (
+    naics_df
+      .set_index("code")
+      [["sector",
+        "subsector",
+        "industry group",
+        "industry",
+        "canadian industry",
+        "class title"]]
+)
 
-        if   lvl == 4: res["Industry"]         = title
-        elif lvl == 3: res["Industry_group"]   = title
-        elif lvl == 2: res["Subsector"]        = title
-        elif lvl == 1: res["Sector"]           = title
-
-        parent = prow.parent
-    return res
+def split_chain(code: str) -> dict:
+    """Return a dict of the NAICS hierarchy for one 6-digit code."""
+    if code not in CODE_TO_HIERARCHY.index:
+        # blank dict keeps .get() below from crashing
+        return dict.fromkeys(
+            ['Sector', 'Subsector', 'Industry group',
+             'Industry', 'Canadian industry', 'Class title'],
+            ""
+        )
+    row = CODE_TO_HIERARCHY.loc[code]
+    return {
+        "Sector":            row['Sector'],
+        "Subsector":         row['Subsector'],
+        "Industry_group":    row['Industry group'],
+        "Industry":          row['Industry'],
+        "Canadian_industry": row['Canadian industry'],
+        "Class_desc":        row['Class title'],
+    }
 
 # ------------------------------------------------------------------
 # 3. FUZZY DESCRIPTION ▸ NAICS CODE  -------------------------------
@@ -161,12 +197,34 @@ def clean_text(raw: str) -> str:
     # 10. Final sanity pass: if all that’s left is empty → return ''
     return txt if txt.strip(".- ") else ""
 
-def fuzzy_naics(desc: str):
-    if not desc: return None, None, 0
-    choice, score, idx = process.extractOne(
-        utils.default_process(desc), titles_list, score_cutoff=FUZZY_THRESHOLD
+def fuzzy_naics(raw_text: str,
+                choices,
+                code_lookup,
+                cutoff: int = 70):
+    """
+    Return (naics_code, naics_title, score).  If nothing clears the cutoff
+    the function returns (None, None, 0) so the caller never crashes.
+    """
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        return None, None, 0
+
+    # thefuzz returns None when score_cutoff isn't met
+    result = process.extractOne(
+        raw_text,
+        choices,
+        scorer=fuzz.token_set_ratio,
+        score_cutoff=cutoff
     )
-    return (codes_6[idx], STRUCT.loc[codes_6[idx]].class_title, score) if score else (None,None,0)
+
+    if result is None:
+        return None, None, 0
+
+    # Accept both 2- and 3-tuple return styles
+    choice = result[0]
+    score  = result[1]
+
+    naics_code = code_lookup.get(choice)          # may be None
+    return naics_code, choice, score
 
 # ------------------------------------------------------------------
 # 4. OPTIONAL ONLINE LOOK-UP ---------------------------------------
@@ -201,46 +259,57 @@ def online_naics(company:str, city:str=""):
     return None, None
 
 # ------------------------------------------------------------------
-# 5. READ SOURCE & PROCESS ROWS ------------------------------------
+# 5. READ SOURCE & PROCESS ROWS  (rewritten)
 # ------------------------------------------------------------------
-df = pd.read_csv(IN_FILE)
-naics_code_col, naics_desc_col = [], []
+df = pd.read_csv(IN_FILE, dtype=str, low_memory=False)   # incoming CSV only
 
-sector_col, subsector_col, ig_col, ind_col = [], [], [], []
-canind_col, classdesc_col = [], []
+naics_code_col, naics_desc_col            = [], []
+sector_col, subsector_col                 = [], []
+ig_col, ind_col                           = [], []
+canind_col, classdesc_col                 = [], []
 
 for _, row in tqdm(df.iterrows(), total=len(df), desc="Rows"):
-    raw_desc = row.get("SubSiteSICDesc", "")
-    desc_cln = clean_text(raw_desc)
+    # -------- CLEAN SIC DESCRIPTION ---------------------------------
+    raw_desc  = row.get("SubSiteSICDesc", "")
+    desc_cln  = clean_text(raw_desc)                     # your expanded cleaner
 
-    codes, descs = [], []
+    codes, titles = [], []                               # ← will stay empty if no match
 
-    # A) fuzzy match first
-    code, title, score = fuzzy_naics(desc_cln)
+    # A) fuzzy match against the NAICS titles ------------------------
+    code, title, score = fuzzy_naics(
+        desc_cln,
+        choices=NAICS_CHOICES,
+        code_lookup=TITLE_TO_CODE
+    )
     if code:
-        codes.append(code); descs.append(title)
+        codes.append(code)
+        titles.append(title)
 
-    # B) fall back to live look-up once / row
+    # B) once-per-row live search (only if fuzzy failed) ------------
     if not codes:
-        c2, t2 = online_naics(str(row.get("CompanyName","")), str(row.get("City","")))
+        c2, t2 = online_naics(
+            str(row.get("CompanyName", "")),
+            str(row.get("City",        "")),
+            pause=PAUSE_API            # throttle your HTTP calls
+        )
         if c2:
-            codes.append(c2); descs.append(t2)
-            time.sleep(PAUSE_API)
+            codes.append(c2)
+            titles.append(t2)
 
-    # write columns (even if empty → "")
+    # -------- WRITE MAIN NAICS COLUMNS ------------------------------
     naics_code_col.append(";".join(codes))
-    naics_desc_col.append(";".join(descs))
+    naics_desc_col.append(";".join(titles))
 
-    # split every code into hierarchy pieces, keep same order
+    # -------- EXPLODE EACH CODE INTO THE 5-LEVEL HIERARCHY ---------
     sectors, subsectors, igs, inds, caninds, cdescs = [], [], [], [], [], []
     for c in codes:
-        ch = split_chain(c)
-        sectors.append(ch["Sector"])
-        subsectors.append(ch["Subsector"])
-        igs.append(ch["Industry_group"])
-        inds.append(ch["Industry"])
-        caninds.append(ch["Canadian_industry"])
-        cdescs.append(ch["Class_desc"])
+        chain = split_chain(c)
+        sectors.append(chain["Sector"])
+        subsectors.append(chain["Subsector"])
+        igs.append(chain["Industry_group"])
+        inds.append(chain["Industry"])
+        caninds.append(chain["Canadian_industry"])
+        cdescs.append(chain["Class_desc"])
 
     sector_col.append(";".join(sectors))
     subsector_col.append(";".join(subsectors))
@@ -250,7 +319,7 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Rows"):
     classdesc_col.append(";".join(cdescs))
 
 # ------------------------------------------------------------------
-# 6. WRITE RESULTS  -------------------------------------------------
+# 6. WRITE RESULTS (unchanged) --------------------------------------
 # ------------------------------------------------------------------
 df["NAICS_Code"]        = naics_code_col
 df["NAICS_Desc"]        = naics_desc_col
@@ -261,15 +330,16 @@ df["Industry"]          = ind_col
 df["Canadian_industry"] = canind_col
 df["Class_desc"]        = classdesc_col
 
-# SharePoint choice sheets
-code_choices  = sorted({c for row in naics_code_col for c in str(row).split(";") if c})
-desc_choices  = sorted({d for row in naics_desc_col for d in str(row).split(";") if d})
+# --- 6-A.  build SharePoint <choice> collections ------------------------
+code_choices = sorted({c for row in naics_code_col for c in str(row).split(";") if c})
+desc_choices = sorted({d for row in naics_desc_col for d in str(row).split(";") if d})
 
+# --- 6-B.  send everything to Excel (multi-sheet) -----------------------  :contentReference[oaicite:1]{index=1}
 with pd.ExcelWriter(OUT_FILE, engine="xlsxwriter") as xls:
     df.to_excel(xls, index=False, sheet_name="CleanedData")
-    pd.DataFrame({"NAICS_Code_Choices": code_choices})\
+    pd.DataFrame({"NAICS_Code_Choices": code_choices}) \
       .to_excel(xls, index=False, sheet_name="Choices_Code")
-    pd.DataFrame({"NAICS_Desc_Choices": desc_choices})\
+    pd.DataFrame({"NAICS_Desc_Choices": desc_choices}) \
       .to_excel(xls, index=False, sheet_name="Choices_Desc")
 
 print(f"✓ Done → {OUT_FILE}")
