@@ -2,21 +2,15 @@
 Clean SubSiteSICDesc ➜ NAICS hierarchy (2022)
 Author: 2025-06-23
 ----------------------------------------------------------
-INPUT : subsites.xlsx            (first worksheet)
-        naics-scian-2022-structure-v1-eng.csv  ⟵ hierarchy
-OUTPUT: subsites_naics_clean.xlsx
+INPUT : cleaned_unions.csv               ⟵ **CSV!**
+        naics-scian-2022-structure-v1-eng.csv  (hierarchy)
+OUTPUT: naics_clean.csv
         • all original cols  +
-        • NAICS_Code            (6-digit; ‘;’-separated)
-        • NAICS_Desc            (same order)
-        • Sector
-        • Subsector
-        • Industry_group
-        • Industry
-        • Canadian_industry
-        • Class_desc
+          … (same list of new columns)
 ----------------------------------------------------------
-pip install pandas requests rapidfuzz tqdm openpyxl xlsxwriter
+pip install pandas requests rapidfuzz tqdm autocorrect xlsxwriter
 """
+
 import os, re, time, requests, pandas as pd
 from rapidfuzz import process, utils
 from tqdm.auto import tqdm
@@ -25,6 +19,21 @@ from typing import List
 import pandas as pd
 from autocorrect import Speller
 from thefuzz import process, fuzz
+import logging
+from datetime import datetime
+
+# ------------------------------------------------------------------
+# 0.  LOGGING CONFIG  (before parameter section is fine) -----------
+# ------------------------------------------------------------------
+LOG_LEVEL = os.getenv("NAICS_LOG", "INFO").upper()   # e.g. export NAICS_LOG=DEBUG
+logging.basicConfig(
+    level   = LOG_LEVEL,
+    format  = "%(asctime)s  %(levelname)-7s | %(message)s",
+    datefmt = "%H:%M:%S"
+)
+tqdm.write(f"> Logging set to {LOG_LEVEL}")
+
+
 
 # ------------------------------------------------------------------
 # 1. PARAMETERS  ----------------------------------------------------
@@ -39,91 +48,74 @@ NAICS_API_TOKEN  = os.getenv("NAICS_API_TOKEN")   # if you have one
 # optional, free fallback (sparser) – no key needed
 OPEN_CORP_URL    = "https://api.opencorporates.com/v0.4/companies/search"
 
+
 # ------------------------------------------------------------------
-# 2. LOAD & NORMALISE NAICS HIERARCHY  ------------------------------
+# 2.  LOAD 2022 NAICS HIERARCHY  (works with the “structure” CSV) --
 # ------------------------------------------------------------------
 def load_structure(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path, dtype=str).fillna("")
+    """
+    Return the raw Statistics-Canada structure sheet *exactly as published*
+    with a few convenience columns added:
 
-    # ←— make ALL column headings predictable
-    df.columns = (
-        df.columns
-          .str.strip()          # remove invisible spaces / line-feeds
-          .str.lower()          # canonical lower-case
-    )
+        • clean_code  … zero-padded string, always 6-chars
+        • level_name  … one of  {'Sector','Subsector','Industry group',
+                                 'Industry','Canadian industry'}
+    """
+    df = (pd.read_csv(path, dtype=str)
+            .fillna("")
+            .rename(columns=lambda c: c.strip()))          # keep official labels
 
-    # friendly aliases – update ONLY here if StatsCan changes wording
-    wanted = {
-        "code"              : "code",
-        "sector"            : "sector",
-        "subsector"         : "subsector",
-        "industry group"    : "industry group",
-        "industry"          : "industry",
-        "canadian industry" : "canadian industry",
-        "class title"       : "class title",
-    }
+    # a) zero-pad codes – lets us slice reliably later
+    df["clean_code"] = df["Code"].str.zfill(6)
 
-    # verify the header really contains everything we need
-    missing = [col for col in wanted if col not in df.columns]
-    if missing:                                   # •–– safety net ––•
-        raise ValueError(
-            f"NAICS structure CSV is missing expected column(s): {missing}"
-        )
+    # b) normalise level names so we can map lengths to the five buckets
+    L2LEVEL = {2: "Sector", 3: "Subsector", 4: "Industry group",
+               5: "Industry", 6: "Canadian industry"}
+    df["level_name"] = df["clean_code"].str.rstrip("0").str.len().map(L2LEVEL)
 
-    # keep everything but index by 6-digit NAICS code for O(1) look-ups
-    return df.rename(columns=wanted).set_index("code")
+    return df.set_index("clean_code")    # 6-digit *string* is now the index
+
 
 STRUCT = load_structure(NAICS_CSV_STRUCT)
 
-# the master DataFrame with clean headings is already in memory,
-# so re-use it instead of re-reading the file:
-naics_df = STRUCT.reset_index().copy()
-naics_df["clean_title"] = (
-    naics_df["class title"]
-      .str.strip()
-      .str.lower()
-)
+# ------------------------------------------------------------------
+# 3.  LOOK-UP TABLES  ---------------------------------------------
+# ------------------------------------------------------------------
+# 111110  →  "Soybean farming"
+TITLE_BY_CODE = STRUCT["Class title"].to_dict()     # exact StatsCan header
 
-NAICS_CHOICES     = naics_df["clean_title"].tolist()
-TITLE_TO_CODE     = dict(zip(naics_df["clean_title"], naics_df["code"]))
+# convenience reverse map for fuzzy search
+TITLE_TO_CODE = {v.lower(): k for k, v in TITLE_BY_CODE.items()}   # lower-keyed!
 
-CODE_TO_HIERARCHY = (
-    naics_df
-      .set_index("code")
-      [["sector",
-        "subsector",
-        "industry group",
-        "industry",
-        "canadian industry",
-        "class title"]]
-)
+# list of 6-digit titles for fuzzy matching
+NAICS_CHOICES = [
+    TITLE_BY_CODE[c] for c in STRUCT.index
+    if len(c.rstrip("0")) == 6          # keep only *full* 6-digit codes
+]
 
-def split_chain(code: str) -> dict:
-    """Return a dict of the NAICS hierarchy for one 6-digit code."""
-    if code not in CODE_TO_HIERARCHY.index:
-        # blank dict keeps .get() below from crashing
-        return dict.fromkeys(
-            ['Sector', 'Subsector', 'Industry group',
-             'Industry', 'Canadian industry', 'Class title'],
-            ""
-        )
-    row = CODE_TO_HIERARCHY.loc[code]
+def split_chain(code6: str) -> dict:
+    """
+    Given a *six-digit string*, return the matching titles for the NAICS chain.
+    Missing pieces return "", never raise.
+    """
+    if not isinstance(code6, str) or not code6.isdigit():
+        return {k: "" for k in
+                ["Sector","Subsector","Industry_group",
+                 "Industry","Canadian_industry","Class_desc"]}
+
+    code6 = code6.zfill(6)                       # safety pad
     return {
-        "Sector":            row['Sector'],
-        "Subsector":         row['Subsector'],
-        "Industry_group":    row['Industry group'],
-        "Industry":          row['Industry'],
-        "Canadian_industry": row['Canadian industry'],
-        "Class_desc":        row['Class title'],
+        "Sector"           : TITLE_BY_CODE.get(code6[:2].ljust(6, "0"),  ""),
+        "Subsector"        : TITLE_BY_CODE.get(code6[:3].ljust(6, "0"),  ""),
+        "Industry_group"   : TITLE_BY_CODE.get(code6[:4].ljust(6, "0"),  ""),
+        "Industry"         : TITLE_BY_CODE.get(code6[:5].ljust(6, "0"),  ""),
+        "Canadian_industry": TITLE_BY_CODE.get(code6,                    ""),
+        "Class_desc"       : TITLE_BY_CODE.get(code6,                    "")
     }
 
 # ------------------------------------------------------------------
 # 3. FUZZY DESCRIPTION ▸ NAICS CODE  -------------------------------
 # ------------------------------------------------------------------
-titles_clean = STRUCT.loc[STRUCT.index.str.len()==6, "class_title"]\
-                   .str.upper().str.replace(r"[^A-Z0-9 ]","",regex=True)
-codes_6      = titles_clean.index.tolist()
-titles_list  = titles_clean.tolist()
 
 spell = Speller(lang="en")
 
@@ -161,15 +153,15 @@ def clean_text(raw: str) -> str:
 
     txt = str(raw)
 
-    # 1. Unicode normalisation (accents → ASCII, weird dashes → '-')  📑 :contentReference[oaicite:0]{index=0}
+    # 1. Unicode normalisation (accents → ASCII, weird dashes → '-')  :contentReference[oaicite:0]{index=0}
     txt = unicodedata.normalize("NFKD", txt)
     txt = txt.encode("ascii", errors="ignore").decode()
 
-    # 2. Kill all line-breaks & tab characters  📑 :contentReference[oaicite:1]{index=1}
+    # 2. Kill all line-breaks & tab characters  :contentReference[oaicite:1]{index=1}
     txt = txt.replace("\r", " ").replace("\n", " ")
 
     # 3. Strip parenthetical or slash/dash comments such as
-    #    “/ 642 per WCB …” or “#108 per WCB June 20/11”  📑 :contentReference[oaicite:2]{index=2}
+    #    “/ 642 per WCB …” or “#108 per WCB June 20/11”  :contentReference[oaicite:2]{index=2}
     txt = re.sub(r"[#/]\s*\d{1,6}.*", " ", txt)
 
     # 4. Remove *leading* or *stand-alone* 3-plus-digit codes
@@ -271,16 +263,22 @@ canind_col, classdesc_col                 = [], []
 for _, row in tqdm(df.iterrows(), total=len(df), desc="Rows"):
     # -------- CLEAN SIC DESCRIPTION ---------------------------------
     raw_desc  = row.get("SubSiteSICDesc", "")
+    t0 = time.perf_counter()
+    
     desc_cln  = clean_text(raw_desc)                     # your expanded cleaner
-
+    logging.debug(f"[{_}] cleaned text -> {desc_cln!r}")
+    
     codes, titles = [], []                               # ← will stay empty if no match
 
     # A) fuzzy match against the NAICS titles ------------------------
+    t1 = time.perf_counter()
     code, title, score = fuzzy_naics(
         desc_cln,
         choices=NAICS_CHOICES,
         code_lookup=TITLE_TO_CODE
     )
+    logging.debug(f"[{_}] fuzzy → {code}, {score}  ({t1-t0:.3f}s)")
+    
     if code:
         codes.append(code)
         titles.append(title)
@@ -289,9 +287,9 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Rows"):
     if not codes:
         c2, t2 = online_naics(
             str(row.get("CompanyName", "")),
-            str(row.get("City",        "")),
-            pause=PAUSE_API            # throttle your HTTP calls
+            str(row.get("City",        ""))
         )
+        logging.info(f"[{_}] web lookup used ({time.perf_counter()-t1:.3f}s)")
         if c2:
             codes.append(c2)
             titles.append(t2)
