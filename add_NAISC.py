@@ -84,14 +84,13 @@ STRUCT = load_structure(NAICS_CSV_STRUCT)
 # 111110  →  "Soybean farming"
 TITLE_BY_CODE = STRUCT["Class title"].to_dict()     # exact StatsCan header
 
-# convenience reverse map for fuzzy search
-TITLE_TO_CODE = {v.lower(): k for k, v in TITLE_BY_CODE.items()}   # lower-keyed!
+naics_df = STRUCT.reset_index()                         # bring columns back
+naics_df["clean_title"] = naics_df["Class title"].str.strip().str.lower()
 
-# list of 6-digit titles for fuzzy matching
-NAICS_CHOICES = [
-    TITLE_BY_CODE[c] for c in STRUCT.index
-    if len(c.rstrip("0")) == 6          # keep only *full* 6-digit codes
-]
+NAICS_CHOICES  = naics_df["clean_title"].tolist()       # → list[str]
+TITLE_TO_CODE  = dict(zip(naics_df["clean_title"],      # → {'soybean farming': '111110', …}
+                         naics_df["clean_code"]))
+
 
 def split_chain(code6: str) -> dict:
     """
@@ -282,9 +281,11 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Rows"):
     if code:
         codes.append(code)
         titles.append(title)
+        logging.info(f"[{_}] ✔︎ fuzzy hit {code} ({score})  {title!r}")
 
     # B) once-per-row live search (only if fuzzy failed) ------------
     if not codes:
+        logging.debug(f"[{_}] ✘ fuzzy miss for {desc_cln!r}")
         c2, t2 = online_naics(
             str(row.get("CompanyName", "")),
             str(row.get("City",        ""))
