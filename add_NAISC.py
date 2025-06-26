@@ -23,31 +23,58 @@ import logging
 from datetime import datetime
 
 # ------------------------------------------------------------------
-# 0.  LOGGING CONFIG  (before parameter section is fine) -----------
+# 0-bis.  LOGGING & TQDM — **drop-in replacement** -----------------
 # ------------------------------------------------------------------
-LOG_LEVEL = os.getenv("NAICS_LOG", "INFO").upper()   # e.g. export NAICS_LOG=DEBUG
+import logging, sys
+from tqdm.auto import tqdm
+
+LOG_LEVEL = os.getenv("NAICS_LOG", "DEBUG").upper()      # DEBUG by default
+
+class TqdmHandler(logging.StreamHandler):
+    """Send log records through tqdm.write() so they stay visible."""
+    def emit(self, record):
+        try:
+            tqdm.write(self.format(record))
+        except (KeyboardInterrupt, SystemExit):          # tqdm quirks
+            raise
+        except Exception:                                # never kill the run
+            self.handleError(record)
+
 logging.basicConfig(
-    level   = LOG_LEVEL,
-    format  = "%(asctime)s  %(levelname)-7s | %(message)s",
-    datefmt = "%H:%M:%S"
+    level   = getattr(logging, LOG_LEVEL, logging.DEBUG),
+    format  = "%(asctime)s %(levelname)-7s | %(message)s",
+    datefmt = "%H:%M:%S",
+    handlers=[TqdmHandler(stream=sys.stderr)],
+    force   = True                                       # ← crucial
 )
-tqdm.write(f"> Logging set to {LOG_LEVEL}")
+tqdm.write(f"> Logging active at {LOG_LEVEL} level")
 
 
 
 # ------------------------------------------------------------------
 # 1. PARAMETERS  ----------------------------------------------------
 # ------------------------------------------------------------------
-IN_FILE          = "naics_clean.csv"
-OUT_FILE         = "naics_part2.csv"
-NAICS_CSV_STRUCT = "naics-scian-2022-structure-v1-eng.csv"
-FUZZY_THRESHOLD  = 70
+IN_FILE          = "naics_part2.csv"
+OUT_FILE         = "naics_part4.csv"
+NAICS_CSV_ELEM = "naics-scian-2022-element-v1-eng.csv"
+FUZZY_THRESHOLD  = 60
 PAUSE_API        = 0.7          # polite delay between live queries
 NAICS_API_TOKEN  = os.getenv("NAICS_API_TOKEN")   # if you have one
 
 # optional, free fallback (sparser) – no key needed
 OPEN_CORP_URL    = "https://api.opencorporates.com/v0.4/companies/search"
 
+def load_elements(path: str) -> pd.DataFrame:
+    """Return level-5 (Canadian-industry) rows from the ‘elements’ sheet."""
+    df = (pd.read_csv(path, dtype=str, on_bad_lines="skip")
+            .fillna("")
+            .rename(columns=lambda c: c.strip()))
+    df["clean_code"]        = df["Code"].str.zfill(6)
+    df["clean_class_title"] = df["Class title"].str.strip().str.lower()
+    df["clean_elem_desc"]   = df["Element Description"].str.strip().str.lower()
+    return df
+
+ELEM = load_elements(NAICS_CSV_ELEM)
 
 # ------------------------------------------------------------------
 # 2.  LOAD 2022 NAICS HIERARCHY  (works with the “structure” CSV) --
@@ -76,41 +103,34 @@ def load_structure(path: str) -> pd.DataFrame:
     return df.set_index("clean_code")    # 6-digit *string* is now the index
 
 
-STRUCT = load_structure(NAICS_CSV_STRUCT)
-
 # ------------------------------------------------------------------
 # 3.  LOOK-UP TABLES  ---------------------------------------------
 # ------------------------------------------------------------------
-# 111110  →  "Soybean farming"
-TITLE_BY_CODE = STRUCT["Class title"].to_dict()     # exact StatsCan header
+elem_df = (
+    pd.read_csv(NAICS_CSV_ELEM, dtype=str)
+      .fillna("")            
+      .rename(columns=lambda c: c.strip())
+)
 
-naics_df = STRUCT.reset_index()                         # bring columns back
-naics_df["clean_title"] = naics_df["Class title"].str.strip().str.lower()
+PHRASE_TO_CODE   = {}
+PHRASE_TO_TITLE  = {}
 
-NAICS_CHOICES  = naics_df["clean_title"].tolist()       # → list[str]
-TITLE_TO_CODE  = dict(zip(naics_df["clean_title"],      # → {'soybean farming': '111110', …}
-                         naics_df["clean_code"]))
+for _, rec in ELEM.iterrows():
+    code   = rec["clean_code"]
+    title  = rec["Class title"].strip()
+    # 1️⃣ exact class title
+    key = rec["clean_class_title"]
+    PHRASE_TO_CODE[key]  = code
+    PHRASE_TO_TITLE[key] = title
+    # 2️⃣ every element description
+    for phrase in rec["clean_elem_desc"].split(";"):     # handle semi-colon lists
+        p = phrase.strip()
+        if p:
+            PHRASE_TO_CODE[p]  = code
+            PHRASE_TO_TITLE[p] = title
 
+NAICS_CHOICES = list(PHRASE_TO_CODE.keys())   
 
-def split_chain(code6: str) -> dict:
-    """
-    Given a *six-digit string*, return the matching titles for the NAICS chain.
-    Missing pieces return "", never raise.
-    """
-    if not isinstance(code6, str) or not code6.isdigit():
-        return {k: "" for k in
-                ["Sector","Subsector","Industry_group",
-                 "Industry","Canadian_industry","Class_desc"]}
-
-    code6 = code6.zfill(6)                       # safety pad
-    return {
-        "Sector"           : TITLE_BY_CODE.get(code6[:2].ljust(6, "0"),  ""),
-        "Subsector"        : TITLE_BY_CODE.get(code6[:3].ljust(6, "0"),  ""),
-        "Industry_group"   : TITLE_BY_CODE.get(code6[:4].ljust(6, "0"),  ""),
-        "Industry"         : TITLE_BY_CODE.get(code6[:5].ljust(6, "0"),  ""),
-        "Canadian_industry": TITLE_BY_CODE.get(code6,                    ""),
-        "Class_desc"       : TITLE_BY_CODE.get(code6,                    "")
-    }
 
 # ------------------------------------------------------------------
 # 3. FUZZY DESCRIPTION ▸ NAICS CODE  -------------------------------
@@ -191,163 +211,134 @@ def clean_text(raw: str) -> str:
 def fuzzy_naics(raw_text: str,
                 choices,
                 code_lookup,
+                title_lookup,
                 cutoff: int = 70):
     """
-    Return (naics_code, naics_title, score).  If nothing clears the cutoff
-    the function returns (None, None, 0) so the caller never crashes.
+    Return (code, canonical_title, score) using both class-titles and element
+    descriptions. If nothing beats `cutoff`, return (None, None, 0).
     """
     if not isinstance(raw_text, str) or not raw_text.strip():
         return None, None, 0
 
-    # thefuzz returns None when score_cutoff isn't met
-    result = process.extractOne(
-        raw_text,
-        choices,
-        scorer=fuzz.token_set_ratio,
-        score_cutoff=cutoff
-    )
-
-    if result is None:
+    hit = process.extractOne(raw_text,
+                             choices,
+                             scorer=fuzz.token_set_ratio,
+                             score_cutoff=cutoff)
+    if hit is None:
         return None, None, 0
 
-    # Accept both 2- and 3-tuple return styles
-    choice = result[0]
-    score  = result[1]
-
-    naics_code = code_lookup.get(choice)          # may be None
-    return naics_code, choice, score
-
+    phrase, score = hit[0], hit[1]
+    code  = code_lookup[phrase]
+    title = title_lookup[phrase]   # canonical “Class title”
+    return code, title, score
 # ------------------------------------------------------------------
 # 4. OPTIONAL ONLINE LOOK-UP ---------------------------------------
 # ------------------------------------------------------------------
-def online_naics(company:str, city:str=""):
-    """Try NAICS.com  → OpenCorporates fallback."""
-    if NAICS_API_TOKEN:
-        try:
-            r = requests.get(
-                "https://api.naics.com/v1/company/",
-                params={"company":company,"city":city,"key":NAICS_API_TOKEN},
-                timeout=15
-            ).json()
-            if r.get("primary_naics"):
-                n = r["primary_naics"][0]
-                return n["code"], n["title"]
-        except Exception:
-            pass
 
-    # ---- OpenCorporates (free) ----
-    try:
-        q  = f'"{company}" {city}'
-        oc = requests.get(OPEN_CORP_URL, params={"q":q,"per_page":1}, timeout=15).json()
-        comps = oc.get("results",{}).get("companies",[])
-        if comps:
-            codes = comps[0]["company"].get("industry_codes",[])
-            for c in codes:
-                if c["industry_code_scheme"]=="US_NAICS_2017":
-                    return c["code"], c.get("description","")
-    except Exception:
-        pass
-    return None, None
-
-# ------------------------------------------------------------------
-# 5. READ SOURCE & PROCESS ROWS  (re-written, no web-look-ups)
-# ------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────────
+# 5. READ SOURCE & PROCESS ROWS  (rewritten, no web-look-ups)  – PATCHED SECTION
+# ────────────────────────────────────────────────────────────────────────────────
 df = pd.read_csv(IN_FILE, dtype=str, low_memory=False)
 
-naics_code_col, naics_desc_col            = [], []
-sector_col, subsector_col                 = [], []
-ig_col, ind_col                           = [], []
-canind_col, classdesc_col                 = [], []
+def is_blank(val: str) -> bool:
+    """
+    True  → value should be treated as 'empty / missing'
+    False → value contains something useful
+    """
+    return (
+        pd.isna(val) or                    # real NaN/None              ✔ pandas test
+        str(val).strip().lower() in {"",   # empty -- after strip
+                                     "nan",
+                                     "none"}                            # str(NaN) fix
+    )
 
-def first_non_blank(row, *cols):
-    """Return the first non-empty string among the given columns."""
-    for c in cols:
-        val = str(row.get(c, "")).strip()
-        if val:
-            return val
+def first_non_blank(row, *cols) -> str:
+    """Return the first non-empty cell among the given columns, else ''. """
+    for col in cols:
+        val = row.get(col, "")
+        if not is_blank(val):
+            return str(val)
     return ""
+
+df = pd.read_csv(IN_FILE, dtype=str, low_memory=False)
+
+naics_e_code_col, naics_e_title_col = [], []
 
 for idx, row in tqdm(df.iterrows(), total=len(df), desc="Rows"):
 
-    existing = str(row.get("NAICS_Code", "")).strip()
-    if existing:                                    # ── rule 5
-        codes   = [existing]
-        titles  = [TITLE_BY_CODE.get(existing, "")]
-        logging.debug(f"[{idx}] NAICS already present → {existing}")
+    # ----- rule 5 : skip if NAICS_Code already holds a good value ---
+    existing_code  = str(row.get("NAICS_Code", ""))
+    existing_title = row.get("NAICS_Desc", "")
+    if existing_code.isdigit():
+        skip_fuzzy = True
+        logging.debug(f"[{idx}] NAICS_Code already set → {existing_code}")
     else:
-        raw_src = first_non_blank(                 # ── rules 1-4
-            row, "Imported_SiteDescription",
-                 "SubSiteSICDesc",
-                 "IndustryType"
+        skip_fuzzy = False
+        existing_code  = ""
+        existing_title = ""
+
+    # ----- decide which source text to fuzzy-match -----------------
+    raw_src = first_non_blank(row,
+                              "Imported_SiteDescription",
+                              "SubSiteSICDesc",
+                              "IndustryType")
+
+            
+    if skip_fuzzy and is_blank(raw_src):
+        best_code, best_title, best_score = None, None, 0
+        logging.debug(f"[{idx}] no candidate text → skip fuzzy")
+        
+    else:
+        desc_cln = clean_text(raw_src)
+        best_code, best_title, best_score = fuzzy_naics(
+            desc_cln,
+            choices      = NAICS_CHOICES,
+            code_lookup  = PHRASE_TO_CODE,
+            title_lookup = PHRASE_TO_TITLE,
+            cutoff       = FUZZY_THRESHOLD
         )
-
-        if not raw_src:                            # nothing to match
-            codes, titles = [], []
-            logging.debug(f"[{idx}] no source text → skip fuzzy")
+        if best_code:
+            logging.info(f"[{idx}] ✔ fuzzy hit {best_code} ({best_score}) "
+                         f"{best_title!r}")
         else:
-            desc_cln = clean_text(raw_src)
-            code, title, score = fuzzy_naics(
-                desc_cln,
-                choices     = NAICS_CHOICES,
-                code_lookup = TITLE_TO_CODE,
-                cutoff      = FUZZY_THRESHOLD
-            )
-            if code:
-                codes, titles = [code], [title]
-                logging.info(f"[{idx}] ✔ fuzzy hit {code} ({score}) {title!r}")
-            else:
-                codes, titles = [], []
-                logging.debug(f"[{idx}] ✘ no fuzzy match for {desc_cln!r}")
+            logging.debug(f"[{idx}] ✘ no fuzzy match for {desc_cln!r}")
 
-    # ---------- write results ----------
-    naics_code_col.append(";".join(codes))
-    naics_desc_col.append(";".join(titles))
+    # ----- choose between previous NAICS_Desc vs new fuzzy result --
+    chosen_code, chosen_title = "", ""
+    if best_code and existing_title:
+        # compare which description matches the raw text better
+        old_score = fuzz.token_set_ratio(clean_text(existing_title),
+                                         clean_text(raw_src))
+        if old_score >= best_score:           # keep previous
+            chosen_code, chosen_title = existing_code, existing_title
+            logging.debug(f"[{idx}] previous NAICS_Desc wins ({old_score} ≥ "
+                          f"{best_score})")
+        else:                                 # take fuzzy result
+            chosen_code, chosen_title = best_code, best_title
+            logging.debug(f"[{idx}] fuzzy result wins ({best_score} > "
+                          f"{old_score})")
+    elif best_code:           # only fuzzy hit exists
+        chosen_code, chosen_title = best_code, best_title
+    elif existing_code:       # only previous exists
+        chosen_code, chosen_title = existing_code, existing_title
+    # else both blank → stay empty
 
-    sectors, subsectors, igs, inds, caninds, cdescs = [], [], [], [], [], []
-    for c in codes:
-        chain = split_chain(c)
-        sectors.append(chain["Sector"])
-        subsectors.append(chain["Subsector"])
-        igs.append(chain["Industry_group"])
-        inds.append(chain["Industry"])
-        caninds.append(chain["Canadian_industry"])
-        cdescs.append(chain["Class_desc"])
-
-    sector_col.append(";".join(sectors))
-    subsector_col.append(";".join(subsectors))
-    ig_col.append(";".join(igs))
-    ind_col.append(";".join(inds))
-    canind_col.append(";".join(caninds))
-    classdesc_col.append(";".join(cdescs))
-
+    naics_e_code_col.append(chosen_code)
+    naics_e_title_col.append(chosen_title)
 
 # ------------------------------------------------------------------
-# 6. WRITE RESULTS  ➜  three separate CSVs
+# APPEND NEW COLUMNS & WRITE CSVs ----------------------------------
 # ------------------------------------------------------------------
-df["NAICS_Code"]        = naics_code_col
-df["NAICS_Desc"]        = naics_desc_col
-df["Sector"]            = sector_col
-df["Subsector"]         = subsector_col
-df["Industry_group"]    = ig_col
-df["Industry"]          = ind_col
-df["Canadian_industry"] = canind_col
-df["Class_desc"]        = classdesc_col
+df["NAICS_e_code"]  = naics_e_code_col
+df["NAICS_e_title"] = naics_e_title_col
 
-# 6-A.  main cleaned data ------------------------------------------
-MAIN_CSV = OUT_FILE               # e.g. "naics_clean.csv"
-df.to_csv(MAIN_CSV, index=False)
-
-# 6-B.  SharePoint choice lists ------------------------------------
-code_choices  = sorted({c for row in naics_code_col  for c in str(row).split(";") if c})
-desc_choices  = sorted({d for row in naics_desc_col for d in str(row).split(";") if d})
-
-pd.DataFrame({"NAICS_Code_Choices":  code_choices}).to_csv(
-    "naics_code_choices.csv",  index=False)
-
-pd.DataFrame({"NAICS_Desc_Choices": desc_choices}).to_csv(
-    "naics_desc_choices.csv", index=False)
+df.to_csv(OUT_FILE, index=False)
+pd.DataFrame({"NAICS_Code_Choices": sorted(set(naics_e_code_col))})\
+  .to_csv("naics_code_choices.csv", index=False)
+pd.DataFrame({"NAICS_Title_Choices": sorted(set(naics_e_title_col))})\
+  .to_csv("naics_title_choices.csv", index=False)
 
 print("✓ CSVs written:")
-print(f"   • {MAIN_CSV}")
+print(f"   • {OUT_FILE}")
 print("   • naics_code_choices.csv")
-print("   • naics_desc_choices.csv")
+print("   • naics_title_choices.csv")
