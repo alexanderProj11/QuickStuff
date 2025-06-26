@@ -4,7 +4,7 @@ import re
 
 # --- load the two CSVs ---
 companies = pd.read_csv("Companies.csv")           # master list
-tracker   = pd.read_csv("FullReprisalTracker.csv")   # needs Matched columns
+tracker   = pd.read_csv("FullFatalityTracker.csv")   # needs Matched columns
 
 # --- simple synonym / abbreviation map ---
 ABBREV = {
@@ -68,4 +68,4 @@ for ridx, row in tracker.iterrows():
         tracker.at[ridx, f"MatchedContact{prefix}"]        = src["Contact"]
 
 tracker.drop(columns=["norm"], inplace=True)
-tracker.to_csv("FullReprisalTracker_updated.csv", index=False)
+tracker.to_csv("FullFatalityTracker_updated.csv", index=False)
