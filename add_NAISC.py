@@ -250,56 +250,59 @@ def online_naics(company:str, city:str=""):
     return None, None
 
 # ------------------------------------------------------------------
-# 5. READ SOURCE & PROCESS ROWS  (rewritten)
+# 5. READ SOURCE & PROCESS ROWS  (re-written, no web-look-ups)
 # ------------------------------------------------------------------
-df = pd.read_csv(IN_FILE, dtype=str, low_memory=False)   # incoming CSV only
+df = pd.read_csv(IN_FILE, dtype=str, low_memory=False)
 
 naics_code_col, naics_desc_col            = [], []
 sector_col, subsector_col                 = [], []
 ig_col, ind_col                           = [], []
 canind_col, classdesc_col                 = [], []
 
-for _, row in tqdm(df.iterrows(), total=len(df), desc="Rows"):
-    # -------- CLEAN SIC DESCRIPTION ---------------------------------
-    raw_desc  = row.get("SubSiteSICDesc", "")
-    t0 = time.perf_counter()
-    
-    desc_cln  = clean_text(raw_desc)                     # your expanded cleaner
-    logging.debug(f"[{_}] cleaned text -> {desc_cln!r}")
-    
-    codes, titles = [], []                               # ← will stay empty if no match
+def first_non_blank(row, *cols):
+    """Return the first non-empty string among the given columns."""
+    for c in cols:
+        val = str(row.get(c, "")).strip()
+        if val:
+            return val
+    return ""
 
-    # A) fuzzy match against the NAICS titles ------------------------
-    t1 = time.perf_counter()
-    code, title, score = fuzzy_naics(
-        desc_cln,
-        choices=NAICS_CHOICES,
-        code_lookup=TITLE_TO_CODE
-    )
-    logging.debug(f"[{_}] fuzzy → {code}, {score}  ({t1-t0:.3f}s)")
-    
-    if code:
-        codes.append(code)
-        titles.append(title)
-        logging.info(f"[{_}] ✔︎ fuzzy hit {code} ({score})  {title!r}")
+for idx, row in tqdm(df.iterrows(), total=len(df), desc="Rows"):
 
-    # B) once-per-row live search (only if fuzzy failed) ------------
-    if not codes:
-        logging.debug(f"[{_}] ✘ fuzzy miss for {desc_cln!r}")
-        c2, t2 = online_naics(
-            str(row.get("CompanyName", "")),
-            str(row.get("City",        ""))
+    existing = str(row.get("NAICS_Code", "")).strip()
+    if existing:                                    # ── rule 5
+        codes   = [existing]
+        titles  = [TITLE_BY_CODE.get(existing, "")]
+        logging.debug(f"[{idx}] NAICS already present → {existing}")
+    else:
+        raw_src = first_non_blank(                 # ── rules 1-4
+            row, "Imported_SiteDescription",
+                 "SubSiteSICDesc",
+                 "IndustryType"
         )
-        logging.info(f"[{_}] web lookup used ({time.perf_counter()-t1:.3f}s)")
-        if c2:
-            codes.append(c2)
-            titles.append(t2)
 
-    # -------- WRITE MAIN NAICS COLUMNS ------------------------------
+        if not raw_src:                            # nothing to match
+            codes, titles = [], []
+            logging.debug(f"[{idx}] no source text → skip fuzzy")
+        else:
+            desc_cln = clean_text(raw_src)
+            code, title, score = fuzzy_naics(
+                desc_cln,
+                choices     = NAICS_CHOICES,
+                code_lookup = TITLE_TO_CODE,
+                cutoff      = FUZZY_THRESHOLD
+            )
+            if code:
+                codes, titles = [code], [title]
+                logging.info(f"[{idx}] ✔ fuzzy hit {code} ({score}) {title!r}")
+            else:
+                codes, titles = [], []
+                logging.debug(f"[{idx}] ✘ no fuzzy match for {desc_cln!r}")
+
+    # ---------- write results ----------
     naics_code_col.append(";".join(codes))
     naics_desc_col.append(";".join(titles))
 
-    # -------- EXPLODE EACH CODE INTO THE 5-LEVEL HIERARCHY ---------
     sectors, subsectors, igs, inds, caninds, cdescs = [], [], [], [], [], []
     for c in codes:
         chain = split_chain(c)
@@ -317,8 +320,9 @@ for _, row in tqdm(df.iterrows(), total=len(df), desc="Rows"):
     canind_col.append(";".join(caninds))
     classdesc_col.append(";".join(cdescs))
 
+
 # ------------------------------------------------------------------
-# 6. WRITE RESULTS (unchanged) --------------------------------------
+# 6. WRITE RESULTS  ➜  three separate CSVs
 # ------------------------------------------------------------------
 df["NAICS_Code"]        = naics_code_col
 df["NAICS_Desc"]        = naics_desc_col
@@ -329,16 +333,21 @@ df["Industry"]          = ind_col
 df["Canadian_industry"] = canind_col
 df["Class_desc"]        = classdesc_col
 
-# --- 6-A.  build SharePoint <choice> collections ------------------------
-code_choices = sorted({c for row in naics_code_col for c in str(row).split(";") if c})
-desc_choices = sorted({d for row in naics_desc_col for d in str(row).split(";") if d})
+# 6-A.  main cleaned data ------------------------------------------
+MAIN_CSV = OUT_FILE               # e.g. "naics_clean.csv"
+df.to_csv(MAIN_CSV, index=False)
 
-# --- 6-B.  send everything to Excel (multi-sheet) -----------------------  :contentReference[oaicite:1]{index=1}
-with pd.ExcelWriter(OUT_FILE, engine="xlsxwriter") as xls:
-    df.to_excel(xls, index=False, sheet_name="CleanedData")
-    pd.DataFrame({"NAICS_Code_Choices": code_choices}) \
-      .to_excel(xls, index=False, sheet_name="Choices_Code")
-    pd.DataFrame({"NAICS_Desc_Choices": desc_choices}) \
-      .to_excel(xls, index=False, sheet_name="Choices_Desc")
+# 6-B.  SharePoint choice lists ------------------------------------
+code_choices  = sorted({c for row in naics_code_col  for c in str(row).split(";") if c})
+desc_choices  = sorted({d for row in naics_desc_col for d in str(row).split(";") if d})
 
-print(f"✓ Done → {OUT_FILE}")
+pd.DataFrame({"NAICS_Code_Choices":  code_choices}).to_csv(
+    "naics_code_choices.csv",  index=False)
+
+pd.DataFrame({"NAICS_Desc_Choices": desc_choices}).to_csv(
+    "naics_desc_choices.csv", index=False)
+
+print("✓ CSVs written:")
+print(f"   • {MAIN_CSV}")
+print("   • naics_code_choices.csv")
+print("   • naics_desc_choices.csv")
