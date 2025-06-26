@@ -38,10 +38,10 @@ tqdm.write(f"> Logging set to {LOG_LEVEL}")
 # ------------------------------------------------------------------
 # 1. PARAMETERS  ----------------------------------------------------
 # ------------------------------------------------------------------
-IN_FILE          = "cleaned_unions.csv"
-OUT_FILE         = "naics_clean.csv"
+IN_FILE          = "naics_clean.csv"
+OUT_FILE         = "naics_part2.csv"
 NAICS_CSV_STRUCT = "naics-scian-2022-structure-v1-eng.csv"
-FUZZY_THRESHOLD  = 80
+FUZZY_THRESHOLD  = 70
 PAUSE_API        = 0.7          # polite delay between live queries
 NAICS_API_TOKEN  = os.getenv("NAICS_API_TOKEN")   # if you have one
 
